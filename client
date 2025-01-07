@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+
+import socket
+import json
+import sys
+import os
+import math
+
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import hmac
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
+
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 5000
+
+CHUNK_SIZE = 64 * 1024  # 64KB per chunk (not heavily used in this demo)
+
+class SecureClient:
+    def __init__(self, user_id):
+        """
+        user_id: The unique 4-digit ID for this client.
+        We store the private key in a local file so that messages
+        sent while the user is offline can be decrypted.
+        """
+        self.user_id = user_id
+
+        # Attempt to load an existing private key from a file
+        self.ec_private_key = self.load_or_generate_key()
+        self.ec_public_key = self.ec_private_key.public_key()
+
+        self.sock = None
+
+    def load_or_generate_key(self):
+        """
+        Loads an existing ECDH key from disk if present, otherwise generates a new one.
+        """
+        key_filename = f"{self.user_id}_ec_key.pem"
+        if os.path.exists(key_filename):
+            # Load existing key
+            with open(key_filename, "rb") as f:
+                print("Loading existing key from disk...")
+                private_key = serialization.load_pem_private_key(
+                    f.read(),
+                    password=None,
+                    backend=default_backend()
+                )
+            return private_key
+        else:
+            # Generate new key and store it
+            print("Generating new ECDH key and saving to disk...")
+            private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+            with open(key_filename, "wb") as f:
+                pem_data = private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                f.write(pem_data)
+            return private_key
+
+    def connect(self):
+        """Establish a TCP connection to the server."""
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((SERVER_HOST, SERVER_PORT))
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+
+    def send_cmd(self, command_dict):
+        """
+        Sends a JSON command to the server, then awaits JSON response.
+        """
+        data = json.dumps(command_dict).encode('utf-8')
+        self.sock.sendall(data)
+
+        response_data = self.sock.recv(4096)
+        if not response_data:
+            return None
+        try:
+            response = json.loads(response_data.decode('utf-8'))
+            return response
+        except:
+            return None
+
+    def register_ephemeral_key(self):
+        """
+        Register our ephemeral (for the purpose of this entire session) public key with the server.
+        """
+        pub_bytes = self.ec_public_key.public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        cmd = {
+            "command": "REGISTER",
+            "user_id": self.user_id,
+            "ephemeral_public": pub_bytes.hex()
+        }
+        resp = self.send_cmd(cmd)
+        return resp
+
+    def fetch_key(self, target_id):
+        """
+        Fetch the ephemeral public key for the target user from the server.
+        """
+        cmd = {
+            "command": "FETCH_KEY",
+            "user_id": self.user_id,
+            "target_id": target_id
+        }
+        resp = self.send_cmd(cmd)
+        return resp
+
+    def send_encrypted_message(self, target_id, plaintext_bytes):
+        """
+        1. Fetch target's ephemeral public key from the server.
+        2. Derive ephemeral shared secret via ECDH.
+        3. Use HKDF to derive an AES key + an HMAC key.
+        4. Encrypt the data (with AES-CBC) and produce an HMAC.
+        5. Upload ciphertext to server ("SEND").
+        """
+        # 1. Get target ephemeral public key
+        resp = self.fetch_key(target_id)
+        if not resp or resp.get("status") != "OK":
+            print(f"Failed to fetch ephemeral public key for {target_id}")
+            return
+
+        target_pub_hex = resp["ephemeral_public"]
+        target_pub_bytes = bytes.fromhex(target_pub_hex)
+        target_public_key = serialization.load_der_public_key(
+            target_pub_bytes,
+            backend=default_backend()
+        )
+
+        # 2. Derive ephemeral shared secret
+        shared_secret = self.ec_private_key.exchange(ec.ECDH(), target_public_key)
+
+        # 3. Derive key material (HKDF)
+        #    The first 32 bytes for AES key, the next 32 for HMAC key
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=64,
+            salt=None,
+            info=b"E2EE Example",
+            backend=default_backend()
+        )
+        key_material = hkdf.derive(shared_secret)
+        aes_key = key_material[:32]
+        hmac_key = key_material[32:]
+
+        # 4. Encrypt with AES-CBC (just for example) + PKCS#7 padding
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+
+        # PKCS#7 padding
+        pad_len = 16 - (len(plaintext_bytes) % 16)
+        padded_data = plaintext_bytes + bytes([pad_len]) * pad_len
+
+        ciphertext = encryptor.update(padded_data) + encryptor.finalize()
+
+        # 5. Compute HMAC of (iv + ciphertext)
+        h = hmac.HMAC(hmac_key, hashes.SHA256(), backend=default_backend())
+        h.update(iv + ciphertext)
+        mac = h.finalize()
+
+        # Combine: iv || ciphertext || mac
+        combined = iv + ciphertext + mac
+
+        # Send to server
+        cmd = {
+            "command": "SEND",
+            "user_id": self.user_id,
+            "target_id": target_id,
+            "ciphertext": combined.hex()
+        }
+        resp2 = self.send_cmd(cmd)
+        return resp2
+
+    def receive_encrypted_messages(self):
+        """
+        Pull the list of incoming messages from the server and decrypt each using ephemeral ECDH.
+        This will retrieve messages stored while the user was offline (if any).
+        """
+        cmd = {
+            "command": "RECEIVE",
+            "user_id": self.user_id
+        }
+        resp = self.send_cmd(cmd)
+        if not resp or resp.get("status") != "OK":
+            print("No messages or error receiving messages.")
+            return
+
+        all_msgs = resp["messages"]  # list of (sender_id, ciphertext_hex)
+        for (sender_id, ciphertext_hex) in all_msgs:
+            # 1. Fetch ephemeral pub from server
+            pk_resp = self.fetch_key(sender_id)
+            if not pk_resp or pk_resp.get("status") != "OK":
+                print(f"Cannot decrypt message from {sender_id} (no ephemeral key).")
+                continue
+
+            sender_pub_hex = pk_resp["ephemeral_public"]
+            sender_pub_bytes = bytes.fromhex(sender_pub_hex)
+            sender_public_key = serialization.load_der_public_key(
+                sender_pub_bytes,
+                backend=default_backend()
+            )
+
+            # 2. ephemeral shared secret
+            shared_secret = self.ec_private_key.exchange(ec.ECDH(), sender_public_key)
+
+            # 3. Derive AES key + HMAC key
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=64,
+                salt=None,
+                info=b"E2EE Example",
+                backend=default_backend()
+            )
+            key_material = hkdf.derive(shared_secret)
+            aes_key = key_material[:32]
+            hmac_key = key_material[32:]
+
+            # Parse the combined blob
+            combined = bytes.fromhex(ciphertext_hex)
+            iv = combined[:16]
+            mac = combined[-32:]
+            real_ciphertext = combined[16:-32]
+
+            # Validate HMAC
+            h = hmac.HMAC(hmac_key, hashes.SHA256(), backend=default_backend())
+            h.update(iv + real_ciphertext)
+            try:
+                h.verify(mac)
+            except InvalidSignature:
+                print(f"[!] Message from {sender_id} failed HMAC verification. Potential MITM or corruption.")
+                continue
+
+            # Decrypt with AES-CBC
+            cipher = Cipher(algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend())
+            decryptor = cipher.decryptor()
+            padded_plain = decryptor.update(real_ciphertext) + decryptor.finalize()
+
+            # Remove PKCS#7 padding
+            pad_len = padded_plain[-1]
+            plaintext = padded_plain[:-pad_len]
+
+            print(f"New message from {sender_id}:\n{plaintext.decode('utf-8', errors='ignore')}\n")
+
+def main():
+    # Prompt for 4-digit user ID
+    user_id = input("Enter your 4-digit ID: ").strip()
+    while len(user_id) != 4 or not user_id.isdigit():
+        user_id = input("Invalid. Please enter exactly 4 digits: ").strip()
+
+    client = SecureClient(user_id)
+    client.connect()
+    reg_resp = client.register_ephemeral_key()
+    print(f"Registered ephemeral key. Server response: {reg_resp}")
+
+    print("Type commands:")
+    print("  send <target_id> <message>")
+    print("  recv")
+    print("  exit")
+
+    while True:
+        raw = input(">>> ").strip()
+        if not raw:
+            continue
+
+        parts = raw.split(" ", 2)
+        cmd = parts[0].lower()
+
+        if cmd == "exit":
+            print("Closing client.")
+            client.close()
+            break
+
+        elif cmd == "send":
+            if len(parts) < 3:
+                print("Usage: send <target_id> <message>")
+                continue
+            target_id = parts[1]
+            message = parts[2].encode('utf-8')
+            response = client.send_encrypted_message(target_id, message)
+            print(f"Server response: {response}")
+
+        elif cmd == "recv":
+            client.receive_encrypted_messages()
+
+        else:
+            print("Unknown command. Valid commands: send, recv, exit")
+
+
+if __name__ == "__main__":
+    main()
